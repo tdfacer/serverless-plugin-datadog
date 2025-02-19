@@ -15,6 +15,16 @@ export interface Monitor {
   [key: string]: MonitorParams;
 }
 
+interface ApiErrorResponse {
+  errors: string[] | Record<string, unknown>;
+}
+
+interface ApiSuccessResponse {
+  [key: string]: any;
+}
+
+type ApiResponse = ApiErrorResponse | ApiSuccessResponse;
+
 export interface ServerlessMonitor {
   name: string;
   threshold: number;
@@ -27,6 +37,25 @@ export interface ServerlessMonitor {
 export interface RecommendedMonitors {
   [key: string]: ServerlessMonitor;
 }
+
+export function isApiErrorResponse(response: ApiResponse): response is ApiErrorResponse {
+  return "errors" in response;
+}
+
+export function formatErrorDetails(errors: ApiErrorResponse["errors"]): string {
+  if (Array.isArray(errors)) {
+    return errors.join(", ");
+  }
+
+  if (typeof errors === "object" && errors !== null) {
+    return Object.entries(errors)
+      .map(([key, value]) => `${key}: ${JSON.stringify(value)}`)
+      .join(", ");
+  }
+
+  return "No error details available";
+}
+
 /**
  * Adds the appropriate tags and required parameters that will be passed as part of the request body for creating and updating monitors
  * @param monitor - the Monitor object that is defined in the serverless.yml file
@@ -103,16 +132,6 @@ function isRecommendedMonitor(serverlessMonitorId: string, recommendedMonitors: 
 }
 
 /**
- * Checks to see if the monitor already exists
- * @param serverlessMonitorId - Unique ID string defined for each serverless monitor
- * @param existingMonitors - Monitors that have already been created
- * @returns true if given monitor already exists
- */
-function doesMonitorExist(serverlessMonitorId: string, existingMonitors: { [key: string]: number }): boolean {
-  return Object.keys(existingMonitors).includes(serverlessMonitorId);
-}
-
-/**
  * Deletes the monitors that have been removed from the plugin
  * @param site Which Datadog site to send data to, e.g. datadoghq.com
  * @param pluginMonitors Monitors that are currently defined in the plugin
@@ -134,9 +153,9 @@ async function deleteRemovedMonitors(
   for (const pluginMonitorId of Object.keys(existingMonitors)) {
     if (!currentMonitorIds.includes(pluginMonitorId)) {
       const response = await deleteMonitor(site, existingMonitors[pluginMonitorId], monitorsApiKey, monitorsAppKey);
-      const successfullyDeleted = handleMonitorsApiResponse(response, pluginMonitorId);
+      const successfullyDeleted = await handleMonitorsApiResponse(response, pluginMonitorId);
       if (successfullyDeleted) {
-        successfullyDeletedMonitors.push(` ${pluginMonitorId}`);
+        successfullyDeletedMonitors.push(`${pluginMonitorId}`);
       }
     }
   }
@@ -151,21 +170,47 @@ async function deleteRemovedMonitors(
  * @param site Which Datadog site to send data to, e.g. datadoghq.com
  * @returns true if the response is 200 OK. Throw an error for other HTTP status codes.
  */
-export function handleMonitorsApiResponse(
+export async function handleMonitorsApiResponse(
   response: Response,
   serverlessMonitorId?: string,
   subdomain?: string,
   site?: string,
-): boolean {
+): Promise<boolean> {
   if (response.status === 200) {
     return true;
-  } else if (response.status === 400) {
-    throw new Error(
-      `400 Bad Request: This could be due to incorrect syntax or a missing required tag for ${serverlessMonitorId}. Have you looked at your monitor tag policies? https://${subdomain}.${site}/monitors/settings/policies`,
-    );
-  } else {
-    throw new Error(`${response.status} ${response.statusText}`);
   }
+
+  let responseData: ApiResponse;
+
+  try {
+    if (typeof response.json === "function") {
+      responseData = await response.json();
+    } else {
+      throw new Error("Response does not support JSON parsing");
+    }
+  } catch (error) {
+    throw new Error(`Unexpected response status: ${response.status} ${response.statusText}`);
+  }
+
+  if (response.status === 400) {
+    const errorDetails = isApiErrorResponse(responseData)
+      ? formatErrorDetails(responseData.errors)
+      : "No error details available";
+
+    const errorParts = [
+      `400 Bad Request: Incorrect syntax or missing required tag`,
+      serverlessMonitorId ? `Monitor ID: ${serverlessMonitorId}` : null,
+      `Error Details: ${errorDetails}`,
+    ].filter(Boolean);
+
+    if (subdomain && site) {
+      errorParts.push(`Check your monitor tag policies: https://${subdomain}.${site}/monitors/settings/policies`);
+    }
+
+    throw new Error(errorParts.join(". "));
+  }
+
+  throw new Error(`Unexpected response status: ${response.status} ${response.statusText}`);
 }
 
 /**
@@ -193,51 +238,62 @@ export async function setMonitors(
   env: string,
 ): Promise<string[]> {
   const recommendedMonitors = await getRecommendedMonitors(site, monitorsApiKey, monitorsAppKey);
-  const serverlessMonitorIdByMonitorId = await getExistingMonitors(
-    site,
-    cloudFormationStackId,
-    monitorsApiKey,
-    monitorsAppKey,
-  );
+  const existingMonitors = await getExistingMonitors(site, cloudFormationStackId, monitorsApiKey, monitorsAppKey);
+
   const successfullyUpdatedMonitors: string[] = [];
   const successfullyCreatedMonitors: string[] = [];
+  const failedMonitors: string[] = [];
 
   for (const monitor of monitors) {
     const serverlessMonitorId = Object.keys(monitor)[0];
-    const monitorIdNumber = serverlessMonitorIdByMonitorId[serverlessMonitorId];
+    const monitorIdNumber = existingMonitors[serverlessMonitorId];
     const monitorParams = buildMonitorParams(monitor, cloudFormationStackId, service, env, recommendedMonitors);
-    const monitorExists = await doesMonitorExist(serverlessMonitorId, serverlessMonitorIdByMonitorId);
-    if (monitorExists) {
-      const response = await updateMonitor(site, monitorIdNumber, monitorParams, monitorsApiKey, monitorsAppKey);
-      const successfullyCreated = handleMonitorsApiResponse(response, serverlessMonitorId, subdomain, site);
-      if (successfullyCreated) {
-        successfullyUpdatedMonitors.push(` ${serverlessMonitorId}`);
+    const monitorExists = existingMonitors.hasOwnProperty(serverlessMonitorId);
+
+    try {
+      let response: Response;
+
+      if (monitorExists) {
+        response = await updateMonitor(site, monitorIdNumber, monitorParams, monitorsApiKey, monitorsAppKey);
+      } else {
+        response = await createMonitor(site, monitorParams, monitorsApiKey, monitorsAppKey);
       }
-    } else {
-      const response = await createMonitor(site, monitorParams, monitorsApiKey, monitorsAppKey);
-      const successfullyUpdated = handleMonitorsApiResponse(response, serverlessMonitorId, subdomain, site);
-      if (successfullyUpdated) {
-        successfullyCreatedMonitors.push(` ${serverlessMonitorId}`);
+
+      const success = await handleMonitorsApiResponse(response, serverlessMonitorId, subdomain, site);
+      if (success) {
+        if (monitorExists) {
+          successfullyUpdatedMonitors.push(`${serverlessMonitorId}`);
+        } else {
+          successfullyCreatedMonitors.push(`${serverlessMonitorId}`);
+        }
       }
+    } catch (error) {
+      failedMonitors.push(serverlessMonitorId);
     }
   }
+
   const successfullyDeletedMonitors = await deleteRemovedMonitors(
     site,
     monitors,
-    serverlessMonitorIdByMonitorId,
+    existingMonitors,
     monitorsApiKey,
     monitorsAppKey,
   );
+
   const logStatements: string[] = [];
   if (successfullyUpdatedMonitors.length > 0) {
-    logStatements.push(`Successfully updated${successfullyUpdatedMonitors}`);
+    logStatements.push(`Successfully updated ${successfullyUpdatedMonitors.join(", ")}`);
   }
   if (successfullyCreatedMonitors.length > 0) {
-    logStatements.push(`Successfully created${successfullyCreatedMonitors}`);
+    logStatements.push(`Successfully created ${successfullyCreatedMonitors.join(", ")}`);
   }
   if (successfullyDeletedMonitors.length > 0) {
-    logStatements.push(`Successfully deleted${successfullyDeletedMonitors}`);
+    logStatements.push(`Successfully deleted ${successfullyDeletedMonitors.join(", ")}`);
   }
+  if (failedMonitors.length > 0) {
+    logStatements.push(`Failed to process ${failedMonitors.join(", ")}`);
+  }
+
   return logStatements;
 }
 

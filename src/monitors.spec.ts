@@ -5,14 +5,37 @@ import {
   updateMonitor,
   getRecommendedMonitors,
 } from "./monitor-api-requests";
-import { Monitor, RecommendedMonitors, setMonitors, buildMonitorParams } from "./monitors";
+import {
+  Monitor,
+  RecommendedMonitors,
+  setMonitors,
+  buildMonitorParams,
+  isApiErrorResponse,
+  formatErrorDetails,
+} from "./monitors";
+import { Response } from "node-fetch";
 
 jest.mock("./monitor-api-requests", () => ({
-  createMonitor: jest.fn(),
-  updateMonitor: jest.fn(),
-  deleteMonitor: jest.fn(),
-  getExistingMonitors: jest.fn(),
-  getRecommendedMonitors: jest.fn(),
+  createMonitor: jest.fn(() =>
+    Promise.resolve({
+      status: 200,
+      json: () => Promise.resolve({ id: 123456 }),
+    } as Response),
+  ),
+  updateMonitor: jest.fn(() =>
+    Promise.resolve({
+      status: 200,
+      json: () => Promise.resolve({ id: 123456 }),
+    } as Response),
+  ),
+  deleteMonitor: jest.fn(() =>
+    Promise.resolve({
+      status: 200,
+      json: () => Promise.resolve({ message: "Monitor deleted" }),
+    } as Response),
+  ),
+  getExistingMonitors: jest.fn(() => Promise.resolve({})),
+  getRecommendedMonitors: jest.fn(() => Promise.resolve({})),
 }));
 
 const CUSTOM_MONITOR_1: Monitor = {
@@ -493,5 +516,58 @@ describe("setMonitors", () => {
       "apikey",
       "appkey",
     );
+  });
+});
+
+describe("isApiErrorResponse", () => {
+  it("returns true if response contains an 'errors' field", () => {
+    const response = { errors: ["Error 1", "Error 2"] };
+    expect(isApiErrorResponse(response)).toBe(true);
+  });
+
+  it("returns false if response does not contain an 'errors' field", () => {
+    const response = { message: "Success" };
+    expect(isApiErrorResponse(response)).toBe(false);
+  });
+
+  it("returns true for error object instead of array", () => {
+    const response = { errors: { field1: "Invalid value", field2: "Missing required field" } };
+    expect(isApiErrorResponse(response)).toBe(true);
+  });
+
+  it("returns false for empty object", () => {
+    const response = {};
+    expect(isApiErrorResponse(response)).toBe(false);
+  });
+
+  it("returns false for non-object values", () => {
+    expect(isApiErrorResponse(null)).toBe(false);
+    expect(isApiErrorResponse(undefined)).toBe(false);
+    expect(isApiErrorResponse("error")).toBe(false);
+    expect(isApiErrorResponse(42)).toBe(false);
+    expect(isApiErrorResponse([])).toBe(false);
+  });
+});
+
+describe("formatErrorDetails", () => {
+  it("formats an array of errors as a comma-separated string", () => {
+    const errors = ["Error 1", "Error 2"];
+    expect(formatErrorDetails(errors)).toBe("Error 1, Error 2");
+  });
+
+  it("formats an object of errors as key-value pairs", () => {
+    const errors = { field1: "Invalid value", field2: "Missing required field" };
+    expect(formatErrorDetails(errors)).toBe('field1: "Invalid value", field2: "Missing required field"');
+  });
+
+  it("handles an empty object gracefully", () => {
+    const errors = {};
+    expect(formatErrorDetails(errors)).toBe("");
+  });
+
+  it("handles non-array and non-object errors gracefully", () => {
+    expect(formatErrorDetails("An unexpected error occurred")).toBe("No error details available");
+    expect(formatErrorDetails(null)).toBe("No error details available");
+    expect(formatErrorDetails(undefined)).toBe("No error details available");
   });
 });
