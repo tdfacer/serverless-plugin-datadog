@@ -13,8 +13,67 @@
 
 set -e
 
-LAYER_NAMES=("Datadog-Node16-x" "Datadog-Node18-x" "Datadog-Node20-x" "Datadog-Node22-x" "Datadog-Python37" "Datadog-Python38" "Datadog-Python38-ARM" "Datadog-Python39" "Datadog-Python39-ARM" "Datadog-Python310" "Datadog-Python310-ARM" "Datadog-Python311" "Datadog-Python311-ARM" "Datadog-Python312" "Datadog-Python312-ARM" "Datadog-Python313" "Datadog-Python313-ARM" "Datadog-Ruby3-2" "Datadog-Ruby3-2-ARM" "Datadog-Extension" "Datadog-Extension-ARM" "dd-trace-dotnet" "dd-trace-dotnet-ARM" "dd-trace-java")
-JSON_LAYER_NAMES=("nodejs16.x" "nodejs18.x" "nodejs20.x" "nodejs22.x" "python3.7" "python3.8" "python3.8-arm" "python3.9" "python3.9-arm" "python3.10" "python3.10-arm" "python3.11" "python3.11-arm" "python3.12" "python3.12-arm" "python3.13" "python3.13-arm" "ruby3.2" "ruby3.2-arm" "extension" "extension-arm" "dotnet" "dotnet-arm" "java")
+LAYER_NAMES=(
+    "Datadog-Node16-x"
+    "Datadog-Node18-x"
+    "Datadog-Node20-x"
+    "Datadog-Node22-x"
+    "Datadog-Python37"
+    "Datadog-Python38"
+    "Datadog-Python38-ARM"
+    "Datadog-Python39"
+    "Datadog-Python39-ARM"
+    "Datadog-Python310"
+    "Datadog-Python310-ARM"
+    "Datadog-Python311"
+    "Datadog-Python311-ARM"
+    "Datadog-Python312"
+    "Datadog-Python312-ARM"
+    "Datadog-Python313"
+    "Datadog-Python313-ARM"
+    "Datadog-Ruby3-2"
+    "Datadog-Ruby3-2-ARM"
+    "Datadog-Ruby3-3"
+    "Datadog-Ruby3-3-ARM"
+    "Datadog-Extension"
+    "Datadog-Extension-ARM"
+    "Datadog-Extension-FIPS"
+    "Datadog-Extension-ARM-FIPS"
+    "dd-trace-dotnet"
+    "dd-trace-dotnet-ARM"
+    "dd-trace-java"
+)
+
+JSON_LAYER_NAMES=(
+    "nodejs16.x"
+    "nodejs18.x"
+    "nodejs20.x"
+    "nodejs22.x"
+    "python3.7"
+    "python3.8"
+    "python3.8-arm"
+    "python3.9"
+    "python3.9-arm"
+    "python3.10"
+    "python3.10-arm"
+    "python3.11"
+    "python3.11-arm"
+    "python3.12"
+    "python3.12-arm"
+    "python3.13"
+    "python3.13-arm"
+    "ruby3.2"
+    "ruby3.2-arm"
+    "ruby3.3"
+    "ruby3.3-arm"
+    "extension"
+    "extension-arm"
+    "extension-fips"
+    "extension-arm-fips"
+    "dotnet"
+    "dotnet-arm"
+    "java"
+)
 
 AVAILABLE_REGIONS=$(aws ec2 describe-regions | jq -r '.[] | .[] | .RegionName')
 
@@ -26,6 +85,18 @@ if [ "$1" = "-g" ]; then
     FILE_NAME="src/layers-gov.json"
 fi
 
+# Fetch the layers for each region in parallel
+echo "Fetching layers for each region"
+rm -rf layers
+mkdir layers
+for region in $AVAILABLE_REGIONS; do
+  {
+    aws lambda list-layers --region "$region" | jq -c '[.Layers[] | {LayerName, LastLayerArn: .LatestMatchingVersion.LayerVersionArn}]' > layers/$region.json
+  } &
+done
+wait # Wait for all parallel jobs to complete
+
+echo "Generating layers json"
 for region in $AVAILABLE_REGIONS
 do
     for ((i=0;i<${#LAYER_NAMES[@]};++i));
@@ -34,7 +105,7 @@ do
         layer_name=${LAYER_NAMES[i]}
         json_layer_name=${JSON_LAYER_NAMES[i]}
 
-        last_layer_arn=$(aws lambda list-layer-versions --layer-name $layer_name --region $region | jq -r ".LayerVersions | .[0] |  .LayerVersionArn | select (.!=null)")
+        last_layer_arn=$(cat layers/$region.json | jq -r --arg layer_name $layer_name '.[] | select(.LayerName == $layer_name) .LastLayerArn')
 
         if [ -z $last_layer_arn ]; then
              >&2 echo "No layer found for $region, $layer_name"
@@ -46,3 +117,5 @@ do
 done
 echo "Writing to ${FILE_NAME}"
 jq '.' <<< $INPUT_JSON > $FILE_NAME
+
+rm -rf layers

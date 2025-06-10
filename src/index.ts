@@ -9,7 +9,7 @@
 import * as Serverless from "serverless";
 import { FunctionDefinition } from "serverless";
 import Service from "serverless/classes/Service";
-import { Provider } from "serverless/plugins/aws/provider/awsProvider";
+import Aws, { Provider } from "serverless/plugins/aws/provider/awsProvider";
 import { version } from "../package.json";
 import { gitMetadata } from "@datadog/datadog-ci";
 import {
@@ -33,7 +33,14 @@ import {
   addStepFunctionLogGroupSubscription,
 } from "./forwarder";
 import { newSimpleGit } from "./git";
-import { applyExtensionLayer, applyLambdaLibraryLayers, findHandlers, FunctionInfo, RuntimeType } from "./layer";
+import {
+  applyExtensionLayer,
+  applyLambdaLibraryLayers,
+  findHandlers,
+  FunctionInfo,
+  RuntimeType,
+  getDefaultIsFIPSEnabledFlag,
+} from "./layer";
 import * as govLayers from "./layers-gov.json";
 import * as layers from "./layers.json";
 import { getCloudFormationStackId } from "./monitor-api-requests";
@@ -139,7 +146,9 @@ module.exports = class ServerlessPlugin {
     if (config.addExtension) {
       this.serverless.cli.log("Adding Datadog Lambda Extension Layer to functions");
       this.debugLogHandlers(handlers);
-      applyExtensionLayer(this.serverless.service, handlers, allLayers, accountId);
+      const isFIPSEnabled =
+        config.isFIPSEnabled ?? getDefaultIsFIPSEnabledFlag(config, this.serverless.service.provider.region);
+      applyExtensionLayer(this.serverless.service, handlers, allLayers, accountId, isFIPSEnabled);
     } else {
       this.serverless.cli.log("Skipping adding Lambda Extension Layer");
     }
@@ -213,60 +222,7 @@ module.exports = class ServerlessPlugin {
         await addExecutionLogGroupsAndSubscriptions(this.serverless.service, aws, datadogForwarderArn);
       }
 
-      if (config.enableStepFunctionsTracing || config.subscribeToStepFunctionLogs) {
-        const resources = this.serverless.service.provider.compiledCloudFormationTemplate?.Resources;
-        const stepFunctions = Object.values((this.serverless.service as any).stepFunctions.stateMachines);
-        if (stepFunctions.length === 0) {
-          this.serverless.cli.log("subscribeToStepFunctionLogs is set to true but no step functions were found.");
-        } else {
-          this.serverless.cli.log("Subscribing step function log groups to Datadog Forwarder");
-          for (const stepFunction of stepFunctions as any[]) {
-            if (!stepFunction.hasOwnProperty("loggingConfig")) {
-              this.serverless.cli.log(`Creating log group for ${stepFunction.name} and logging to it with level ALL.`);
-              await addStepFunctionLogGroup(aws, resources, stepFunction);
-            } else {
-              this.serverless.cli.log(`Found logging config for step function ${stepFunction.name}`);
-              const loggingConfig = stepFunction.loggingConfig;
-
-              if (loggingConfig.level !== "ALL") {
-                loggingConfig.level = "ALL";
-                this.serverless.cli.log(
-                  `Warning: Setting log level to ALL for step function ${stepFunction.name} so traces can be generated.`,
-                );
-              }
-              if (loggingConfig.includeExecutionData !== true) {
-                loggingConfig.includeExecutionData = true;
-                this.serverless.cli.log(
-                  `Warning: Setting includeExecutionData to true for step function ${stepFunction.name} so traces can be generated.`,
-                );
-              }
-            }
-            // subscribe step function log group to datadog forwarder regardless of how the log group was created
-            await addStepFunctionLogGroupSubscription(resources, stepFunction, datadogForwarderArn);
-          }
-        }
-
-        if (config.mergeStepFunctionAndLambdaTraces || config.propagateTraceContext) {
-          this.serverless.cli.log(
-            `mergeStepFunctionAndLambdaTraces and propagateTraceContext will be deprecated. Please use propagateUpstreamTrace instead`,
-          );
-        }
-        if (config.mergeStepFunctionAndLambdaTraces || config.propagateTraceContext || config.propagateUpstreamTrace) {
-          this.serverless.cli.log(
-            `mergeStepFunctionAndLambdaTraces or propagateUpstreamTrace is true, trying to modify Step Functions' definitions to add trace context.`,
-          );
-          mergeStepFunctionAndLambdaTraces(resources, this.serverless);
-        }
-      } else {
-        // Recommend Step Functions instrumentation for customers who do not set enableStepFunctionsTracing to true
-        try {
-          inspectAndRecommendStepFunctionsInstrumentation(this.serverless);
-        } catch (error) {
-          this.serverless.cli.log(
-            `Error raise when inspecting if there are any uninstrumented Step Functions state machines. Error: ${error}`,
-          );
-        }
-      }
+      await this.instrumentStepFunctions(config, aws, datadogForwarderArn);
 
       for (const error of errors) {
         this.serverless.cli.log(error);
@@ -325,6 +281,78 @@ module.exports = class ServerlessPlugin {
       await addOutputLinks(this.serverless, config.site, config.subdomain, handlers);
     } else {
       this.serverless.cli.log("Skipped adding output links");
+    }
+  }
+
+  /**
+   * Do the major part of the work for instrumenting step functions.
+   * This function does not set tags. That is done in afterPackageCompileFunctions().
+   */
+  private async instrumentStepFunctions(config: Configuration, aws: Aws, datadogForwarderArn: string): Promise<void> {
+    const compiledCfnTemplate = this.serverless.service.provider.compiledCloudFormationTemplate;
+
+    // Compiled CloudFormation template may be unavailable if the user only deploys part of the stack.
+    // See https://github.com/DataDog/serverless-plugin-datadog/issues/593
+    // In that case, skip instrumenting step functions.
+    if (!compiledCfnTemplate) {
+      this.serverless.cli.log(`Compiled CloudFormation template not found. Skipping instrumenting step functions.
+This is expected if you only deploy part of the stack.`);
+      return;
+    }
+
+    if (config.enableStepFunctionsTracing || config.subscribeToStepFunctionLogs) {
+      const resources = compiledCfnTemplate.Resources;
+      const stepFunctions = Object.values((this.serverless.service as any).stepFunctions.stateMachines);
+      if (stepFunctions.length === 0) {
+        this.serverless.cli.log("subscribeToStepFunctionLogs is set to true but no step functions were found.");
+      } else {
+        this.serverless.cli.log("Subscribing step function log groups to Datadog Forwarder");
+        for (const stepFunction of stepFunctions as any[]) {
+          if (!stepFunction.hasOwnProperty("loggingConfig")) {
+            this.serverless.cli.log(`Creating log group for ${stepFunction.name} and logging to it with level ALL.`);
+            await addStepFunctionLogGroup(aws, resources, stepFunction);
+          } else {
+            this.serverless.cli.log(`Found logging config for step function ${stepFunction.name}`);
+            const loggingConfig = stepFunction.loggingConfig;
+
+            if (loggingConfig.level !== "ALL") {
+              loggingConfig.level = "ALL";
+              this.serverless.cli.log(
+                `Warning: Setting log level to ALL for step function ${stepFunction.name} so traces can be generated.`,
+              );
+            }
+            if (loggingConfig.includeExecutionData !== true) {
+              loggingConfig.includeExecutionData = true;
+              this.serverless.cli.log(
+                `Warning: Setting includeExecutionData to true for step function ${stepFunction.name} so traces can be generated.`,
+              );
+            }
+          }
+          // subscribe step function log group to datadog forwarder regardless of how the log group was created
+          await addStepFunctionLogGroupSubscription(resources, stepFunction, datadogForwarderArn);
+        }
+      }
+
+      if (config.mergeStepFunctionAndLambdaTraces || config.propagateTraceContext) {
+        this.serverless.cli.log(
+          `mergeStepFunctionAndLambdaTraces and propagateTraceContext will be deprecated. Please use propagateUpstreamTrace instead`,
+        );
+      }
+      if (config.mergeStepFunctionAndLambdaTraces || config.propagateTraceContext || config.propagateUpstreamTrace) {
+        this.serverless.cli.log(
+          `mergeStepFunctionAndLambdaTraces or propagateUpstreamTrace is true, trying to modify Step Functions' definitions to add trace context.`,
+        );
+        mergeStepFunctionAndLambdaTraces(resources, this.serverless);
+      }
+    } else {
+      // Recommend Step Functions instrumentation for customers who do not set enableStepFunctionsTracing to true
+      try {
+        inspectAndRecommendStepFunctionsInstrumentation(this.serverless);
+      } catch (error) {
+        this.serverless.cli.log(
+          `Error raise when inspecting if there are any uninstrumented Step Functions state machines. Error: ${error}`,
+        );
+      }
     }
   }
 
@@ -592,12 +620,11 @@ function validateConfiguration(config: Configuration): void {
     "us3.datadoghq.com",
     "us5.datadoghq.com",
     "ap1.datadoghq.com",
+    "ap2.datadoghq.com",
     "ddog-gov.com",
   ];
   if (!config.testingMode && config.site !== undefined && !siteList.includes(config.site.toLowerCase())) {
-    throw new Error(
-      "Warning: Invalid site URL. Must be either datadoghq.com, datadoghq.eu, us3.datadoghq.com, us5.datadoghq.com, ap1.datadoghq.com, or ddog-gov.com.",
-    );
+    throw new Error(`Warning: Invalid site URL. Must be one of ${siteList.join(", ")}.`);
   }
   if (config.addExtension) {
     if (

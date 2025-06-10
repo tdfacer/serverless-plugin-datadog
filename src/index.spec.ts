@@ -347,6 +347,58 @@ describe("ServerlessPlugin", () => {
         },
       });
     });
+
+    it("adds FIPS extension layer by default for GovCloud regions", async () => {
+      mock({});
+      const serverless = {
+        cli: {
+          log: () => {},
+        },
+        getProvider: (_name: string) => awsMock(),
+        service: {
+          getServiceName: () => "dev",
+          provider: {
+            region: "us-gov-east-1",
+          },
+          functions: {
+            node1: {
+              handler: "my-func.ev",
+              layers: [],
+              runtime: "nodejs20.x",
+            },
+          },
+          custom: {
+            datadog: {
+              addExtension: true,
+              site: "ddog-gov.com",
+              apiKey: 1234,
+            },
+          },
+        },
+      };
+
+      const plugin = new ServerlessPlugin(serverless, {});
+      await plugin.hooks["before:package:createDeploymentArtifacts"]();
+      expect(serverless).toMatchObject({
+        service: {
+          functions: {
+            node1: {
+              handler: "my-func.ev",
+              layers: [
+                expect.stringMatching(/arn\:aws\-us\-gov\:lambda\:us\-gov\-east\-1\:.*\:layer\:.*/),
+                expect.stringMatching(
+                  /arn\:aws\-us\-gov\:lambda\:us\-gov\-east\-1\:.*\:layer\:Datadog-Extension-FIPS\:.*/,
+                ),
+              ],
+              runtime: "nodejs20.x",
+            },
+          },
+          provider: {
+            region: "us-gov-east-1",
+          },
+        },
+      });
+    });
   });
 
   it("Adds tracing layer for dotnet", async () => {
@@ -751,7 +803,7 @@ describe("ServerlessPlugin", () => {
       }
       expect(threwError).toBe(true);
       expect(thrownErrorMessage).toEqual(
-        "Warning: Invalid site URL. Must be either datadoghq.com, datadoghq.eu, us3.datadoghq.com, us5.datadoghq.com, ap1.datadoghq.com, or ddog-gov.com.",
+        "Warning: Invalid site URL. Must be one of datadoghq.com, datadoghq.eu, us3.datadoghq.com, us5.datadoghq.com, ap1.datadoghq.com, ap2.datadoghq.com, ddog-gov.com.",
       );
     });
 
@@ -2063,6 +2115,34 @@ describe("ServerlessPlugin", () => {
           },
         },
       });
+    });
+
+    // Compiled CloudFormation template may be unavailable if the user only deploys part of the stack.
+    // See https://github.com/DataDog/serverless-plugin-datadog/issues/593
+    it("does not throw an error if compiled CloudFormation template is unavailable", async () => {
+      const serverless = {
+        cli: { log: () => {} },
+        getProvider: (_name: string) => awsMock(),
+        service: {
+          getServiceName: () => "dev",
+          getAllFunctions: () => [],
+          provider: {
+            region: "us-east-1",
+          },
+          functions: {
+            first: {},
+          },
+          custom: {
+            datadog: {
+              forwarderArn: "some-arn",
+              addExtension: false,
+              enableStepFunctionsTracing: true,
+            },
+          },
+        },
+      };
+      const plugin = new ServerlessPlugin(serverless, {});
+      await expect(plugin.hooks["after:package:createDeploymentArtifacts"]()).resolves.not.toThrow();
     });
   });
 });

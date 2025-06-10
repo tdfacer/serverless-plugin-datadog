@@ -100,7 +100,7 @@ export interface Configuration {
   // User specified list of libraries for Cold Start Tracing to ignore
   coldStartTraceSkipLibs?: string;
 
-  // Whether to encode the tracing context in the lambda authorizer's reponse data. Default true
+  // Whether to encode the tracing context in the lambda authorizer's response data. Default true
   encodeAuthorizerContext?: boolean;
   // Whether to parse and use the encoded tracing context from lambda authorizers. Default true
   decodeAuthorizerContext?: boolean;
@@ -116,13 +116,17 @@ export interface Configuration {
   // Step Functions Tracing
   enableStepFunctionsTracing?: boolean;
   mergeStepFunctionAndLambdaTraces?: boolean;
-  propagateTraceContext?: boolean; // Added by mistake. Should have been propagateUpstreamTrace
+  propagateTraceContext?: boolean; // Deprecated: This was added by mistake. Use propagateUpstreamTrace instead.
   propagateUpstreamTrace?: boolean;
 
   // Disables handler redirection
   // Used for testing or for someone exclusively forwarding logs
   // or including the library only for metrics.
   redirectHandlers?: boolean;
+
+  // When set to `true`, a FIPS-compliant lambda extension layer will be used.
+  // Only works if `addExtension` is `true`.
+  isFIPSEnabled?: boolean;
 }
 const webpackPluginName = "serverless-webpack";
 const apiKeyEnvVar = "DD_API_KEY";
